@@ -97,20 +97,37 @@ float softTriangle(float2 xy, float2 v1, float2 v2, float2 v3, float sigma)
     return sigmoid(-d, sigma);
 }
 
-[CudaKernel]
 [Differentiable]
-[AutoPyBindCUDA]
-void rasterize(
+[PreferRecompute]
+float clamp_(float val, float val_min, float val_max)
+{
+    if (val > val_max) {
+        return val_max;
+    } else if (val < val_min) {
+        return val_min;
+    } else {
+        return val;
+    }
+}
+[Differentiable]
+[PreferRecompute]
+float3 clamp_(float3 val, float val_min, float val_max)
+{
+    return float3(
+        clamp_(val.x, val_min, val_max),
+        clamp_(val.y, val_min, val_max),
+        clamp_(val.z, val_min, val_max)
+    );
+}
+
+[Differentiable]
+float3 rasterize_(
+    no_diff uint2 xy,
     Camera camera,
     DiffTensorView vertices,
     DiffTensorView color,
     DiffTensorView output)
 {
-    uint3 globalIdx = cudaBlockIdx() * cudaBlockDim() + cudaThreadIdx();
-
-    if (globalIdx.x >= output.size(0) || globalIdx.y >= output.size(1))
-        return;
-
     // Load vertices of our triangle.
     // Assume our input tensor is of the form (3, 2) where 3 is the number of vertices
     // and 2 is the number of coordinates per vertex.
@@ -125,12 +142,32 @@ void rasterize(
     float sigma = 0.02;
 
     // Compute result for the current pixel.
-    float2 screen_sample = globalIdx.xy + 0.5;
+    float2 screen_sample = xy + 0.5;
     float2 world_sample = camera.screenToWorld(screen_sample);
 
     float hit = softTriangle(world_sample, v1, v2, v3, sigma);
 
     float3 result = hit * c + (1 - hit) * background_color;
+
+    // return clamp_(result, 0.0f, 1.0f); // This works
+    return clamp(result, 0.0f, 1.0f); // This does not work
+}
+
+[CudaKernel]
+[Differentiable]
+[AutoPyBindCUDA]
+void rasterize(
+    Camera camera,
+    DiffTensorView vertices,
+    DiffTensorView color,
+    DiffTensorView output)
+{
+    uint3 globalIdx = cudaBlockIdx() * cudaBlockDim() + cudaThreadIdx();
+
+    if (globalIdx.x >= output.size(0) || globalIdx.y >= output.size(1))
+        return;
+
+    float3 result = rasterize_(globalIdx.xy, camera, vertices, color, output);
     
     // Write-back using the 'storeOnce' method that has a more efficient 
     // derivative implementation if each index is written to only once.
@@ -139,4 +176,27 @@ void rasterize(
     output.storeOnce(uint3(globalIdx.xy, 1), result.y);
     output.storeOnce(uint3(globalIdx.xy, 2), result.z);
 
+}
+
+[CudaKernel]
+[AutoPyBindCUDA]
+void rasterize_forward_diff(
+    Camera camera,
+    DiffTensorView vertices,
+    DiffTensorView color,
+    DiffTensorView output)
+{
+    uint3 globalIdx = cudaBlockIdx() * cudaBlockDim() + cudaThreadIdx();
+
+    if (globalIdx.x >= output.size(0) || globalIdx.y >= output.size(1))
+        return;
+
+    DifferentialPair<float3> result = fwd_diff(rasterize_)(globalIdx.xy, camera, vertices, color, output);
+
+    // Write-back using the 'storeOnce' method that has a more efficient
+    // derivative implementation if each index is written to only once.
+    //
+    output.storeOnce(uint3(globalIdx.xy, 0), result.d.x);
+    output.storeOnce(uint3(globalIdx.xy, 1), result.d.y);
+    output.storeOnce(uint3(globalIdx.xy, 2), result.d.z);
 }

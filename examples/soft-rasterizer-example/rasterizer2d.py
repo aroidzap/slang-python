@@ -37,6 +37,21 @@ class Rasterizer2d(Function):
         return output
     
     @staticmethod
+    def forward_diff(width, height, camera, sigma, vertices, color):
+        output = torch.zeros((width, height, 3), dtype=torch.float).cuda()
+        rasterizer2d.rasterize_forward_diff(
+            camera=camera,
+            vertices=vertices,
+            color=color,
+            output=output
+        ).launchRaw(
+            blockSize=(16, 16, 1), 
+            gridSize=((width + 15)//16, (height + 15)//16, 1)
+        )
+
+        return output
+    
+    @staticmethod
     def backward(ctx, grad_output):
         vertices, color, output = ctx.saved_tensors 
         camera = ctx.camera
@@ -104,7 +119,7 @@ def optimize(i):
 
     # Forward pass: render the image.
     outputImage = rasterizer.apply(1024, 1024, camera, sigma, vertices, color)
-    outputImage.register_hook(set_grad(outputImage))
+    # outputImage.register_hook(set_grad(outputImage))
 
     # Compute the loss.
     loss = torch.mean((outputImage - targetImage) ** 2)
@@ -113,20 +128,28 @@ def optimize(i):
     loss.backward()
 
     # Update the parameters.
-    optimizer.step()
+    optimizer.step()    
     
     if i % 10 == 0:
         ax1.clear()
         ax1.imshow(outputImage.permute(1, 0, 2).detach().cpu().numpy(), origin='lower', extent=[-1, 1, -1, 1])
+        ax1.set_title("output (0,1)")
+        ax1.axis("off")
         ax2.clear()
-        ax2.imshow(outputImage.grad[:,:,1].T.detach().cpu().numpy(), origin='lower', extent=[-1, 1, -1, 1])
+        fwdDiffImage = rasterizer.forward_diff(1024, 1024, camera, sigma, vertices, color)
+        ax2.imshow(0.5 + 0.5 * fwdDiffImage.permute(1, 0, 2).detach().cpu().numpy(), origin='lower', extent=[-1, 1, -1, 1])
+        ax2.set_title("fwd_diff (-1,1)")
+        ax2.axis("off")
         ax3.clear()
         ax3.imshow(targetImage.permute(1, 0, 2).detach().cpu().numpy(), origin='lower', extent=[-1, 1, -1, 1])
+        ax3.set_title("target (0,1)")
+        ax3.axis("off")
 
     # Zero the gradients.
     optimizer.zero_grad()
 
-import matplotlib.animation as animation
-ani = animation.FuncAnimation(fig, optimize, frames=numIterations, interval=10)
-writer = animation.FFMpegWriter(fps=30)
-ani.save('rasterizer2d.mp4', writer=writer)
+for i in range(numIterations):
+    optimize(i)
+    plt.draw()
+    if plt.waitforbuttonpress(0.01):
+        exit()
